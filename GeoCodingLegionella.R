@@ -8,7 +8,7 @@ library(ggplot2)
 library(luaRlp)
 
 
-reGeoCode <- FALSE
+reGeoCode <- TRUE
 
 files <- sapply(c(
   "O:/Abteilung Humanmedizin (AHM)/Referat 32/32_6/Legionella Project/LIMS_2_RIDOM/Referat_31/",

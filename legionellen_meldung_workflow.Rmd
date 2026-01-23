@@ -1,0 +1,359 @@
+---
+title: "Legionellen-Meldedaten 2025 – Datenaufbereitung, Adressstandardisierung und Aggregation"
+author: " "
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Ziel und Kontext
+
+Nach § 53 Abs. 4 Trinkwasserverordnung (TrinkwV) sind zugelassene Trinkwasseruntersuchungsstellen verpflichtet, Daten zu den im vorangegangenen Kalenderjahr durchgeführten Legionellenuntersuchungen zusammenfassend zu melden.  
+In diesem Dokument wird nachvollziehbar beschrieben, wie aus den LIMS-Exportdaten:
+
+- einheitlich interpretierbare Messwerte (inkl. `>…` / `<…`-Eingaben),
+- bereinigte und konsolidierte Adressen,
+- sowie die geforderten Zählkennzahlen
+
+abgeleitet werden.
+
+## Überblick über den Workflow
+
+Der technische Ablauf besteht aus vier Bausteinen:
+
+1. **Einlesen und Zusammenführen** der Excel-Exports aus mehreren Referaten  
+2. **Interpretation der Ergebnisfelder** (Strings wie `>2` als numerisch interpretierbar machen)  
+3. **Adressbereinigung und Deduplikation** (deterministisch + fehlertolerant)  
+4. **Aggregation** der Ergebnisse pro Referat und als Gesamtsumme  
+
+Die folgenden Abschnitte dokumentieren die Schritte und Annahmen.
+
+## Annahme: Adresse als Surrogat für Trinkwasserinstallation
+
+Die UBA-Meldung fragt u.a. nach der *Anzahl der untersuchten Trinkwasserinstallationen* sowie nach Installationen/Proben, bei denen der technische Maßnahmenwert erreicht wurde.
+
+Da in den LIMS-Exportdaten in der vorliegenden Struktur keine eindeutige, systemweit stabile Installations-ID vorhanden ist, wird **die bereinigte Adresse (`addr_final`) als Surrogat für eine Installation** verwendet.
+
+**Praktische Bedeutung dieser Annahme:**
+
+- Mehrere Proben derselben Adresse werden derselben Installation zugeordnet.
+- Adressvarianten (Tippfehler, Abkürzungen, Zusatztexte) werden soweit möglich vereinheitlicht.
+- Diese Annäherung ist fachlich plausibel, ersetzt aber keine echte, eindeutige Installations-Referenz im System.
+
+## Adressbereinigung und Wiederverwendbarkeit
+
+### Motivation
+
+In den LIMS-Daten liegen Adressen häufig als Kombination mehrerer Felder vor (Straße, Ort, Gemeinde, Einrichtungenamen etc.). Dadurch entstehen viele Varianten derselben Adresse, z.B.:
+
+- unterschiedliche Schreibweisen (`Str.` / `Straße` / `strasse`)
+- Tippfehler (`waisenhausstrr`)
+- zusammengezogene Tokens (`nordallee1`)
+- Zusatzinformationen (Einrichtungsname hinter der Hausnummer)
+
+### Vorgehen
+
+Die Adressaufbereitung ist modular aufgebaut und gliedert sich in:
+
+- **Schritt 1 (deterministisch):** Regelbasierte Normalisierung (z.B. `Str.` → `strasse`, Vereinheitlichung von Leerzeichen, Trennung zusammengezogener Tokens)  
+- **Schritt 2a (key-basiert):** Zusammenführen innerhalb gleicher PLZ+Ort, Entfernen von Zusatztext hinter der Hausnummer  
+- **Schritt 2b (fuzzy):** Fehlertoleranter Abgleich **nur des Straßennamens**, bei **exakter Hausnummer**, innerhalb PLZ+Ort  
+
+Der Vorteil dieser Struktur ist, dass der gesamte Adress-Block **als wiederverwendbares Modul** für weitere Projekte eingesetzt werden kann (z.B. andere Parameter, andere Berichtsjahre, andere Auswertungen), ohne den restlichen Analysecode ändern zu müssen.
+
+## Perspektive: Referenzierung über Geo-/Adressdatenbanken
+
+Eine noch sauberere Vereinheitlichung wäre möglich, wenn die Adressen **gegen eine Referenzdatenbank** abgeglichen würden (Geocoding / Gazetteer / amtliche Adresslisten). Vorteile:
+
+- Kanonische Schreibweisen (Straße, PLZ, Ort) aus einer autoritativen Quelle  
+- Robustere Deduplikation (z.B. über Koordinaten statt Textähnlichkeit)  
+- Bessere Behandlung von Umbenennungen, Ortsteilen, Grenzfällen  
+
+Je nach Datenmenge und Anforderungen kann das über etablierte Dienste (z.B. OSM/Nominatim, kommerzielle Anbieter) oder interne Referenzdaten erfolgen. Der aktuelle Ansatz ist bewusst offline/heuristisch gehalten, um ohne externe Abhängigkeiten auszukommen.
+
+## Perspektive: Referenzierung bereits bei der Dateneingabe im LIMS
+
+Langfristig wäre die höchste Datenqualität erreichbar, wenn Adressen im LIMS **bereits bei der Eingabe referenziert** würden (z.B. über:
+
+- Autovervollständigung gegen eine Referenzliste,
+- feste Installationsobjekte mit eindeutiger ID,
+- Validierung von PLZ/Ort-Straße-Kombinationen).
+
+Damit würde die Adressqualität systemisch verbessert, nachgelagerte Bereinigung reduziert und Auswertungen (inkl. Meldewesen) würden deutlich stabiler und weniger fehleranfällig.
+
+Diese Art von Referenzierung ist in modernen LIMS/ERP-Systemen üblich und würde insbesondere bei wiederkehrenden Probenahmestellen einen großen Mehrwert bringen.
+
+## Technischer Teil: Code
+
+### Pakete
+
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(stringi)
+library(stringdist)
+library(igraph)
+library(knitr)
+```
+
+### Einlesen und Zusammenführen der Exporte
+
+```{r}
+files <- sapply(c(
+  "O:/Abteilung Humanmedizin (AHM)/Referat 32/32_6/Legionella Project/LIMS_2_RIDOM/Referat_31/",
+  "O:/Abteilung Humanmedizin (AHM)/Referat 32/32_6/Legionella Project/LIMS_2_RIDOM/Referat_32/",
+  "O:/Abteilung Humanmedizin (AHM)/Referat 32/32_6/Legionella Project/LIMS_2_RIDOM/Referat_33/"
+), list.files, pattern = ".*2025*.xls", full.names = TRUE) |>
+  unlist(use.names = FALSE)
+
+xl_list <- lapply(files, read_excel)
+common_colnames <- Reduce(intersect, lapply(xl_list, colnames))
+LIMS <- do.call(rbind, lapply(xl_list, function (x) x[, common_colnames]))
+
+LIMS$Ref <- substr(LIMS$Labornummer, 1, 2)
+```
+
+### Ergebnisfelder interpretieren (`>…`, `<…`, exakt)
+
+```{r}
+LIMS <- LIMS %>%
+  mutate(
+    Accuracy = case_when(
+      str_detect(Ergebnis...19, ">") ~ "gr",
+      str_detect(Ergebnis...19, "<") ~ "kl",
+      !is.na(suppressWarnings(as.numeric(Ergebnis...19))) ~ "exa",
+      TRUE ~ NA_character_
+    ),
+    KolNum = suppressWarnings(as.numeric(gsub(">|<|\\s+", "", Ergebnis...19)))
+  )
+```
+
+### Adresse zusammensetzen (Rohform)
+
+```{r}
+LIMS <- LIMS %>%
+  mutate(
+    adresse = paste(
+      Straße...9,
+      Gemeinde, Ort,
+      Einrichtung, `Name des Bades`,
+      PLZ
+    )
+  )
+```
+
+### Adressbereinigung und Deduplikation (Modul)
+
+```{r}
+norm_txt <- function(x) {
+  x <- ifelse(is.na(x), "", x)
+  x <- str_squish(x)
+  x <- str_to_lower(x)
+
+  x <- str_replace_all(x, "\\bna\\b", "")
+  x <- stringi::stri_trans_general(x, "de-ASCII")
+  x <- str_replace_all(x, "ß", "ss")
+
+  x <- str_replace_all(x, "[,;]", " ")
+  x <- str_replace_all(x, "\\s+", " ")
+  x <- str_trim(x)
+
+  x <- str_replace_all(x, "\\bstraße\\b", "strasse")
+  x <- str_replace_all(x, "\\bstr\\.?\\b", "strasse")
+
+  x <- str_replace_all(x, "([[:alpha:]])strasse\\b", "\\1 strasse")
+  x <- str_replace_all(x, "([[:alpha:]])str\\.?\\b", "\\1 strasse")
+
+  x <- str_replace_all(x, "strr\\b", "strasse")
+
+  x <- str_replace_all(x, "-", " ")
+  x <- str_replace_all(x, "([[:alpha:]])platz\\b", "\\1 platz")
+
+  x <- str_replace_all(x, "([[:alpha:]])allee\\b", "\\1 allee")
+  x <- str_replace_all(x, "\\ballee(?=\\d)", "allee ")
+
+  x <- str_replace_all(x, "\\.(?=\\s|$)", "")
+
+  x <- str_replace_all(x, "(\\d)\\s*\\+\\s*(\\d)", "\\1-\\2")
+  x <- str_replace_all(x, "(\\d)\\s*-\\s*(\\d)", "\\1-\\2")
+
+  x <- str_replace_all(x, "\\bstrasse(?=\\d)", "strasse ")
+
+  str_squish(x)
+}
+
+pick_city <- function(gemeinde, ort) {
+  g <- norm_txt(gemeinde)
+  o <- norm_txt(ort)
+  ifelse(o == "" | o == g, g, o)
+}
+
+make_short_address <- function(street, plz, city) {
+  s <- norm_txt(street)
+  p <- str_extract(norm_txt(plz), "\\b\\d{5}\\b")
+  p <- ifelse(is.na(p), "", p)
+  c <- norm_txt(city)
+
+  out <- str_squish(paste0(s, ", ", p, " ", c))
+  out <- str_replace_all(out, "^,\\s*", "")
+  out <- str_replace_all(out, ",\\s*$", "")
+  out
+}
+
+extract_street_hnr <- function(short_addr_norm) {
+  pre <- str_trim(str_extract(short_addr_norm, "^[^,]+"))
+  street_hnr <- str_trim(str_extract(
+    pre,
+    "^[[:alpha:] .]+\\s*\\d+[[:alpha:]]?(?:\\s*-\\s*\\d+[[:alpha:]]?)?"
+  ))
+  ifelse(is.na(street_hnr) | street_hnr == "", pre, street_hnr)
+}
+
+split_street_hnr <- function(street_hnr) {
+  x <- norm_txt(street_hnr)
+  hnr <- str_extract(x, "\\b\\d+[[:alpha:]]?(?:-\\d+[[:alpha:]]?)?\\b\\s*$")
+  hnr <- str_trim(ifelse(is.na(hnr), "", hnr))
+  street <- str_trim(str_replace(x, "\\b\\d+[[:alpha:]]?(?:-\\d+[[:alpha:]]?)?\\b\\s*$", ""))
+  street <- str_squish(street)
+  tibble(street_name = street, hnr_exact = hnr)
+}
+
+cluster_streetnames <- function(street_names, method = "jw", max_dist = 0.10) {
+  u <- unique(street_names)
+  u <- u[!is.na(u) & u != ""]
+  if (length(u) <= 1) return(rep(1L, length(street_names)))
+
+  D <- stringdist::stringdistmatrix(u, u, method = method)
+  adj <- (D <= max_dist) & (row(D) != col(D))
+  g <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE)
+
+  memb <- igraph::components(g)$membership
+  names(memb) <- u
+  as.integer(memb[street_names])
+}
+
+LIMS2 <- LIMS %>%
+  mutate(
+    city = pick_city(Gemeinde, Ort),
+    short_addr = make_short_address(`Straße...9`, PLZ, city)
+  ) %>%
+  mutate(
+    short_addr_norm = norm_txt(short_addr),
+    plz_norm  = str_extract(short_addr_norm, "\\b\\d{5}\\b"),
+    plz_norm  = ifelse(is.na(plz_norm), "", plz_norm),
+    city_norm = norm_txt(city),
+    street_hnr = extract_street_hnr(short_addr_norm),
+    addr_key = str_squish(paste(plz_norm, city_norm, street_hnr))
+  ) %>%
+  group_by(plz_norm, city_norm, addr_key) %>%
+  mutate(
+    short_addr_keymerge = short_addr[which.min(nchar(short_addr))]
+  ) %>%
+  ungroup()
+
+tmp <- split_street_hnr(LIMS2$street_hnr)
+
+LIMS2 <- LIMS2 %>%
+  bind_cols(tmp) %>%
+  group_by(plz_norm, city_norm, hnr_exact) %>%
+  mutate(
+    street_cluster = cluster_streetnames(street_name, method = "jw", max_dist = 0.10)
+  ) %>%
+  group_by(plz_norm, city_norm, hnr_exact, street_cluster) %>%
+  mutate(
+    street_name_canon = names(which.max(table(street_name))),
+    addr_final = str_squish(paste0(street_name_canon, " ", hnr_exact, ", ", plz_norm, " ", city_norm))
+  ) %>%
+  ungroup()
+```
+
+## Aggregation für die Meldetabelle
+
+Für die Meldung werden die folgenden Kennzahlen benötigt:
+
+- Anzahl untersuchter Installationen (hier: `addr_final`)
+- Anzahl Installationen, bei denen der technische Maßnahmenwert erreicht wurde
+- Anzahl untersuchter Proben (Zeilen)
+- Anzahl Proben, bei denen der technische Maßnahmenwert erreicht wurde
+
+```{r}
+TMW_LEG <- 100  # technischer Maßnahmenwert Legionellen (KBE/100 ml)
+
+df_leg <- LIMS2 %>%
+  mutate(
+    installation = addr_final,
+    tmw_reached = case_when(
+      !is.na(KolNum) & Accuracy %in% c("exa", "gr") & KolNum >= TMW_LEG ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  filter(!is.na(installation), installation != "") %>%
+  filter(!is.na(Ref), Ref != "") %>%
+  filter(!is.na(KolNum))
+
+uba_by_ref <- df_leg %>%
+  group_by(Ref) %>%
+  summarise(
+    anzahl_installationen_untersucht = n_distinct(installation),
+    anzahl_installationen_mit_tmw = n_distinct(installation[tmw_reached]),
+    anzahl_proben_untersucht = n(),
+    anzahl_proben_mit_tmw = sum(tmw_reached, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Ref)
+
+uba_gesamt <- df_leg %>%
+  summarise(
+    anzahl_installationen_untersucht = n_distinct(installation),
+    anzahl_installationen_mit_tmw = n_distinct(installation[tmw_reached]),
+    anzahl_proben_untersucht = n(),
+    anzahl_proben_mit_tmw = sum(tmw_reached, na.rm = TRUE)
+  )
+```
+
+## Ergebnisübersicht
+
+```{r}
+kable(
+  uba_by_ref,
+  col.names = c(
+    "Referat",
+    "Untersuchte Installationen",
+    "Installationen ≥ TMW",
+    "Untersuchte Proben",
+    "Proben ≥ TMW"
+  ),
+  align = "lrrrr",
+  caption = "Übersicht der Meldedaten nach Referat"
+)
+
+kable(
+  uba_gesamt,
+  col.names = c(
+    "Untersuchte Installationen",
+    "Installationen ≥ TMW",
+    "Untersuchte Proben",
+    "Proben ≥ TMW"
+  ),
+  align = "rrrr",
+  caption = "Gesamtsumme (alle Referate zusammen)"
+)
+```
+
+## Hinweise und mögliche Weiterentwicklung
+
+- Die Verwendung von `addr_final` als Installations-Surrogat ist eine pragmatische Lösung und erhöht die Konsistenz der Aggregation gegenüber Rohadressen.
+- Eine Referenzierung gegen eine Geo-/Adressdatenbank würde die Qualität weiter verbessern (kanonische Schreibweisen, Koordinaten, robustere Deduplikation).
+- In einem modernen LIMS kann eine solche Referenzierung bereits bei der Dateneingabe umgesetzt werden (Validierung/Autovervollständigung, Installationsobjekte mit eindeutiger ID), wodurch nachgelagerte Bereinigung und manuelle Nacharbeit deutlich reduziert würden.

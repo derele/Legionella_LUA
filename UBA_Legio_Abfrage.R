@@ -236,44 +236,86 @@ table(LIMS2$addr_final)
 ##   LIMS2$addr_final
 ## ------------------------------------------------------------
 
-LIMS$Zweck <- gsub(".*(Zweck \\w).*", "\\1", LIMS$`Probenahme SOP`)
+LIMS2$Zweck <- gsub(".*(Zweck \\w).*", "\\1", LIMS$`Probenahme SOP`)
 
-table(LIMS$Zweck)
+LIMS2$Ref <- substr(LIMS2$Labornummer, 1, 2)
 
-LIMS$Zweck[LIMS$Zweck%in%"Probenahme gemäß SOP Q EX.T 0002 05 (Schöpfprobe nach DIN EN ISO 19458:2006-12)"] <- "Schöpfprobe"
-
-LIMS$Ref <- substr(LIMS$Labornummer, 1, 2)
-
-LIMS$Accuracy <- ifelse(grepl(">", LIMS$Ergebnis...19),
-                        "gr", ifelse(grepl("<", LIMS$Ergebnis...19),
-                                     "kl",
-                                     ifelse(!is.na(as.numeric(LIMS$Ergebnis...19)),
-                                            "exa", NA)))
-
-LIMS$KolNum <- as.numeric(gsub(">|<| *", "", LIMS$Ergebnis...19))
-
-## Okay, NAs unvermeidbar
-LIMS$Ergebnis...19[is.na(LIMS$KolNum)]
+LIMS2 <- LIMS2 %>%
+  mutate(
+    Accuracy = case_when(
+      str_detect(Ergebnis...19, ">") ~ "gr",
+      str_detect(Ergebnis...19, "<") ~ "kl",
+      !is.na(suppressWarnings(as.numeric(Ergebnis...19))) ~ "exa",
+      TRUE ~ NA_character_
+    ),
+    KolNum = suppressWarnings(as.numeric(gsub(">|<|\\s+", "", Ergebnis...19)))
+  )
 
 
-table(LIMS$Accuracy, cut(LIMS$KolNum, breaks = c(0, 2, 10, 100, 1000, Inf)),
-      useNA="ifany")
+TMW_LEG <- 100  # Technischer Maßnahmenwert Legionellen (KBE/100 ml)
 
-table(LIMS$Ergebnis...22,
-      cut(LIMS$KolNum, breaks = c(0, 2, 10, 100, 1000, Inf)),
-      useNA="ifany")
+df_leg <- LIMS2 %>%
+  mutate(
+    installation = addr_final,
 
-LIMS$Latex <- ifelse(grepl("[S|s]pezies|spec", LIMS$Ergebnis...22), "Spp",
-                     ifelse(grepl("[S|s]erogruppe *1", LIMS$Ergebnis...22), "Ser 1",
-                            ifelse(grepl("[S|s]erogrup+e *2", LIMS$Ergebnis...22), "Ser 2-14", NA)))
+    # TMW erreicht: exakte Werte und ">"-Werte zählen als mindestens KolNum
+    # "<"-Werte werden konservativ als nicht erreicht gewertet
+    tmw_reached = case_when(
+      !is.na(KolNum) & Accuracy %in% c("exa", "gr") & KolNum >= TMW_LEG ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) %>%
+  filter(!is.na(installation), installation != "") %>%
+  filter(!is.na(Ref), Ref != "")   # Referat muss vorhanden sein
+
+# ---- Kennzahlen pro Referat
+uba_by_ref <- df_leg %>%
+  group_by(Ref) %>%
+  summarise(
+    anzahl_installationen_untersucht = n_distinct(installation),
+    anzahl_installationen_mit_tmw = n_distinct(installation[tmw_reached]),
+    anzahl_proben_untersucht = n(),                     # alle Zeilen zählen als Proben
+    anzahl_proben_mit_tmw = sum(tmw_reached, na.rm=TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Ref)
+
+uba_by_ref
+
+# ---- Optional: Gesamtsumme (alle Referate zusammen)
+uba_gesamt <- df_leg %>%
+  summarise(
+    anzahl_installationen_untersucht = n_distinct(installation),
+    anzahl_installationen_mit_tmw = n_distinct(installation[tmw_reached]),
+    anzahl_proben_untersucht = n(),
+    anzahl_proben_mit_tmw = sum(tmw_reached, na.rm=TRUE)
+  )
+
+uba_gesamt
 
 
-table(LIMS$Ergebnis...22, LIMS$Latex, useNA="ifany")
+uba_by_ref %>%
+  mutate(
+    Ref = as.character(Ref)
+  ) %>%
+  arrange(Ref) %>%
+  print(n = Inf)
 
+library(knitr)
 
-table(LIMS$Latex, cut(LIMS$KolNum, breaks = c(0, 1, 10, 100, 1000, Inf)),
-      useNA="ifany")
-
-table(LIMS$Latex, cut(LIMS$KolNum, breaks = c(0, 1, 10, 100, 1000, Inf)),
-      LIMS$Accuracy, useNA="ifany")
+uba_by_ref %>%
+  mutate(
+    Ref = paste("Referat", Ref)
+  ) %>%
+  knitr::kable(
+    align = "lrrrr",
+    col.names = c(
+      "Referat",
+      "Untersuchte Installationen",
+      "Installationen ≥ TMW",
+      "Untersuchte Proben",
+      "Proben ≥ TMW"
+    ),
+    caption = "Übersicht Legionellenuntersuchungen nach Referat"
+  )
 
