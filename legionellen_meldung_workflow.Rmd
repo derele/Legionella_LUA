@@ -1,5 +1,5 @@
 ---
-title: "Legionellen-Meldedaten 2025 – Datenaufbereitung, Adressstandardisierung und Aggregation"
+title: "Legionellen 2025 – Datenaufbereitung, Adressstandardisierung und Aggregation"
 author: " "
 date: "`r format(Sys.Date(), '%d.%m.%Y')`"
 output:
@@ -20,7 +20,7 @@ knitr::opts_chunk$set(
 ## Ziel und Kontext
 
 Nach § 53 Abs. 4 Trinkwasserverordnung (TrinkwV) sind zugelassene Trinkwasseruntersuchungsstellen verpflichtet, Daten zu den im vorangegangenen Kalenderjahr durchgeführten Legionellenuntersuchungen zusammenfassend zu melden.  
-In diesem Dokument wird nachvollziehbar beschrieben, wie aus den LIMS-Exportdaten:
+In diesem Dokument wird nachvollziehbar beschrieben, wie aus LIMS-Exportdaten (`LDM_Abfragesicht_9`):
 
 - einheitlich interpretierbare Messwerte (inkl. `>…` / `<…`-Eingaben),
 - bereinigte und konsolidierte Adressen,
@@ -30,12 +30,13 @@ abgeleitet werden.
 
 ## Überblick über den Workflow
 
-Der technische Ablauf besteht aus vier Bausteinen:
+Der technische Ablauf besteht aus fünf Bausteinen:
 
 1. **Einlesen und Zusammenführen** der Excel-Exports aus mehreren Referaten  
-2. **Interpretation der Ergebnisfelder** (Strings wie `>2` als numerisch interpretierbar machen)  
-3. **Adressbereinigung und Deduplikation** (deterministisch + fehlertolerant)  
-4. **Aggregation** der Ergebnisse pro Referat und als Gesamtsumme  
+2. **Identifikation der relevanten Proben**, d.h. Berücksichtigung ausschlißlich von Untersuchungen nach §31
+3. **Interpretation der Ergebnisfelder** (Strings wie `>2` als numerisch interpretierbar machen)  
+4. **Adressbereinigung und Deduplikation** (deterministisch + fehlertolerant)  
+5. **Aggregation** der Ergebnisse pro Referat und als Gesamtsumme  
 
 Die folgenden Abschnitte dokumentieren die Schritte und Annahmen.
 
@@ -49,13 +50,15 @@ Da in den LIMS-Exportdaten in der vorliegenden Struktur keine eindeutige, system
 
 - Mehrere Proben derselben Adresse werden derselben Installation zugeordnet.
 - Adressvarianten (Tippfehler, Abkürzungen, Zusatztexte) werden soweit möglich vereinheitlicht.
-- Diese Annäherung ist fachlich plausibel, ersetzt aber keine echte, eindeutige Installations-Referenz im System.
+- Diese Annäherung ersetzt aber keine echte, eindeutige Installations-Referenz im System.
+- Bei Großeinrichtungen mit mehreren Installationen an einer Adresse wird die Zahl der Installationen unterschätzt.
+- Bei unkorrigierten Adressvarianten wird die Anzahl der Installationen überschätzt. 
 
 ## Adressbereinigung und Wiederverwendbarkeit
 
 ### Motivation
 
-In den LIMS-Daten liegen Adressen häufig als Kombination mehrerer Felder vor (Straße, Ort, Gemeinde, Einrichtungenamen etc.). Dadurch entstehen viele Varianten derselben Adresse, z.B.:
+Mitarbeiterinnen in der Datenerfassung nutzen bisweilen keine im System Hinterlegten Adressen, sondern erstellen Neueingaben. IM den LIMS liegen Adressen als Kombination mehrerer Felder vor (Straße, Ort, Gemeinde, Einrichtungenamen etc.), dadurch entstehen Varianten derselben Adresse, z.B.:
 
 - unterschiedliche Schreibweisen (`Str.` / `Straße` / `strasse`)
 - Tippfehler (`waisenhausstrr`)
@@ -72,28 +75,6 @@ Die Adressaufbereitung ist modular aufgebaut und gliedert sich in:
 
 Der Vorteil dieser Struktur ist, dass der gesamte Adress-Block **als wiederverwendbares Modul** für weitere Projekte eingesetzt werden kann (z.B. andere Parameter, andere Berichtsjahre, andere Auswertungen), ohne den restlichen Analysecode ändern zu müssen.
 
-## Perspektive: Referenzierung über Geo-/Adressdatenbanken
-
-Eine noch sauberere Vereinheitlichung wäre möglich, wenn die Adressen **gegen eine Referenzdatenbank** abgeglichen würden (Geocoding / Gazetteer / amtliche Adresslisten). Vorteile:
-
-- Kanonische Schreibweisen (Straße, PLZ, Ort) aus einer autoritativen Quelle  
-- Robustere Deduplikation (z.B. über Koordinaten statt Textähnlichkeit)  
-- Bessere Behandlung von Umbenennungen, Ortsteilen, Grenzfällen  
-
-Je nach Datenmenge und Anforderungen kann das über etablierte Dienste (z.B. OSM/Nominatim, kommerzielle Anbieter) oder interne Referenzdaten erfolgen. Der aktuelle Ansatz ist bewusst offline/heuristisch gehalten, um ohne externe Abhängigkeiten auszukommen.
-
-## Perspektive: Referenzierung bereits bei der Dateneingabe im LIMS
-
-Langfristig wäre die höchste Datenqualität erreichbar, wenn Adressen im LIMS **bereits bei der Eingabe referenziert** würden (z.B. über:
-
-- Autovervollständigung gegen eine Referenzliste,
-- feste Installationsobjekte mit eindeutiger ID,
-- Validierung von PLZ/Ort-Straße-Kombinationen).
-
-Damit würde die Adressqualität systemisch verbessert, nachgelagerte Bereinigung reduziert und Auswertungen (inkl. Meldewesen) würden deutlich stabiler und weniger fehleranfällig.
-
-Diese Art von Referenzierung ist in modernen LIMS/ERP-Systemen üblich und würde insbesondere bei wiederkehrenden Probenahmestellen einen großen Mehrwert bringen.
-
 ## Technischer Teil: Code
 
 ### Pakete
@@ -106,6 +87,12 @@ library(stringi)
 library(stringdist)
 library(igraph)
 library(knitr)
+library(magrittr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(tidyr)
+
 ```
 
 ### Einlesen und Zusammenführen der Exporte
@@ -124,6 +111,27 @@ LIMS <- do.call(rbind, lapply(xl_list, function (x) x[, common_colnames]))
 
 LIMS$Ref <- substr(LIMS$Labornummer, 1, 2)
 ```
+
+### Identifizieren und Auswahl der Utersuchungen nach §31
+
+```{r subset-par31}
+# Übersicht: Material-Ausprägungen
+table(LIMS$Material, useNA = "ifany")
+
+
+# Übersicht: §31-Flag (korrekt: pattern ist "§31")
+table(grepl("§31", LIMS$Material), useNA = "ifany")
+
+
+# Subset: nur §31
+LIMS <- LIMS %>%
+  filter(grepl("§31", Material))
+
+# Kontrolle nach Subset
+table(LIMS$Material, useNA = "ifany")
+```
+
+
 
 ### Ergebnisfelder interpretieren (`>…`, `<…`, exakt)
 
@@ -277,9 +285,21 @@ LIMS2 <- LIMS2 %>%
     addr_final = str_squish(paste0(street_name_canon, " ", hnr_exact, ", ", plz_norm, " ", city_norm))
   ) %>%
   ungroup()
+
+options(tibble.width = Inf)
+
+LIMS2 %>%
+  group_by(addr_final) %>%
+  summarise(
+    n_street_variants = n_distinct(Straße...9),
+    p_street_v = paste(unique(Straße...9), collapse = " / "),
+    .groups = "drop"
+  )  %>%
+  arrange(desc(n_street_variants))
+
 ```
 
-## Aggregation für die Meldetabelle
+## Aggregation für die UBA-Tabelle
 
 Für die Meldung werden die folgenden Kennzahlen benötigt:
 
@@ -323,9 +343,10 @@ uba_gesamt <- df_leg %>%
   )
 ```
 
-## Ergebnisübersicht
+## Ergebnisübersicht <- HIER 
 
-```{r}
+
+```{r Ergebnisübersicht}
 kable(
   uba_by_ref,
   col.names = c(
@@ -352,8 +373,192 @@ kable(
 )
 ```
 
-## Hinweise und mögliche Weiterentwicklung
 
-- Die Verwendung von `addr_final` als Installations-Surrogat ist eine pragmatische Lösung und erhöht die Konsistenz der Aggregation gegenüber Rohadressen.
-- Eine Referenzierung gegen eine Geo-/Adressdatenbank würde die Qualität weiter verbessern (kanonische Schreibweisen, Koordinaten, robustere Deduplikation).
-- In einem modernen LIMS kann eine solche Referenzierung bereits bei der Dateneingabe umgesetzt werden (Validierung/Autovervollständigung, Installationsobjekte mit eindeutiger ID), wodurch nachgelagerte Bereinigung und manuelle Nacharbeit deutlich reduziert würden.
+## Ergebnisübersicht (Details zur Plausibilitätsprüfung)
+
+
+```{r positivitaet-proben-vs-installationen, fig.height=8, fig.width=9}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(tidyr)
+
+TMW_LEG <- 100  # Maßnahmenwert
+
+# Datumsspalte (bereits vorhanden)
+LIMS2$datum <- as.Date(LIMS2$`Probenahme  (Datum)`)
+
+# Basisdaten für Zeitreihen
+df_time <- LIMS2 %>%
+  mutate(
+    tmw_reached = case_when(
+      !is.na(KolNum) & Accuracy %in% c("exa", "gr") & KolNum >= TMW_LEG ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    month = floor_date(datum, "month")
+  ) %>%
+  filter(!is.na(month)) %>%
+  filter(!is.na(Ref), Ref != "") %>%
+  filter(!is.na(addr_final), addr_final != "") %>%
+  filter(!is.na(KolNum))
+
+# --- Installation positiv, wenn im Monat irgendeine Probe positiv ist
+inst_month <- df_time %>%
+  group_by(month, addr_final) %>%
+  summarise(inst_pos = any(tmw_reached, na.rm = TRUE), .groups = "drop")
+
+inst_month_ref <- df_time %>%
+  group_by(Ref, month, addr_final) %>%
+  summarise(inst_pos = any(tmw_reached, na.rm = TRUE), .groups = "drop")
+
+# --- Monatsaggregation gesamt: Proben- und Installationsrate
+mon_all <- df_time %>%
+  group_by(month) %>%
+  summarise(
+    n_proben = n(),
+    pos_proben = sum(tmw_reached, na.rm = TRUE),
+    rate_proben = pos_proben / n_proben,
+    .groups = "drop"
+  ) %>%
+  left_join(
+    inst_month %>%
+      group_by(month) %>%
+      summarise(
+        n_inst = n(),
+        pos_inst = sum(inst_pos, na.rm = TRUE),
+        rate_inst = pos_inst / n_inst,
+        .groups = "drop"
+      ),
+    by = "month"
+  )
+
+plot_all <- mon_all %>%
+  transmute(
+    month,
+    `Proben` = rate_proben,
+    `Installationen` = rate_inst,
+    n_proben, n_inst
+  ) %>%
+  pivot_longer(cols = c("Proben", "Installationen"),
+               names_to = "Einheit", values_to = "rate") %>%
+  mutate(
+    n_label = ifelse(Einheit == "Proben",
+                     paste0("n=", n_proben),
+                     paste0("n=", n_inst))
+  )
+
+# --- Monatsaggregation pro Referat: Proben- und Installationsrate
+mon_ref <- df_time %>%
+  group_by(Ref, month) %>%
+  summarise(
+    n_proben = n(),
+    pos_proben = sum(tmw_reached, na.rm = TRUE),
+    rate_proben = pos_proben / n_proben,
+    .groups = "drop"
+  ) %>%
+  left_join(
+    inst_month_ref %>%
+      group_by(Ref, month) %>%
+      summarise(
+        n_inst = n(),
+        pos_inst = sum(inst_pos, na.rm = TRUE),
+        rate_inst = pos_inst / n_inst,
+        .groups = "drop"
+      ),
+    by = c("Ref", "month")
+  ) %>%
+  mutate(
+    Ref = paste("Referat", Ref)  # Facet-Label erweitern
+  )
+
+plot_ref <- mon_ref %>%
+  transmute(
+    Ref, month,
+    `Proben` = rate_proben,
+    `Installationen` = rate_inst,
+    n_proben, n_inst
+  ) %>%
+  pivot_longer(cols = c("Proben", "Installationen"),
+               names_to = "Einheit", values_to = "rate") %>%
+  mutate(
+    n_label = ifelse(Einheit == "Proben",
+                     paste0("n=", n_proben),
+                     paste0("n=", n_inst))
+  )
+
+# --- Gemeinsame y-Limits mit "Luft" nach unten & oben (damit Labels nicht abgeschnitten werden)
+y_max <- max(c(plot_all$rate, plot_ref$rate), na.rm = TRUE)
+y_pad_up <- 0.05
+y_pad_down <- 0.06
+y_lim <- c(0 - y_pad_down, min(1, y_max + y_pad_up))
+
+# =========================
+# Plot 1: Gesamt
+# =========================
+ggplot(plot_all, aes(x = month, y = rate, color = Einheit)) +
+  geom_line() +
+  geom_point() +
+  # Installationen: Label über dem Punkt
+  geom_text(
+    data = subset(plot_all, Einheit == "Installationen"),
+    aes(label = n_label),
+    vjust = -0.6, size = 3, show.legend = FALSE
+  ) +
+  # Proben: Label unter dem Punkt
+  geom_text(
+    data = subset(plot_all, Einheit == "Proben"),
+    aes(label = n_label),
+    vjust = 1.2, size = 3, show.legend = FALSE
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = y_lim) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  labs(
+    title = "Positivitätsrate (TMW ≥ 100) pro Monat – Proben vs. Installationen (Gesamt)",
+    x = "Monat",
+    y = "Positivitätsrate",
+    color = ""
+  ) +
+  theme_minimal()
+
+# =========================
+# Plot 2: Nach Referat (Facets)
+# =========================
+ggplot(plot_ref, aes(x = month, y = rate, color = Einheit)) +
+  geom_line() +
+  geom_point() +
+  # Installationen: Label über dem Punkt
+  geom_text(
+    data = subset(plot_ref, Einheit == "Installationen"),
+    aes(label = n_label),
+    vjust = -0.6, size = 2.6, show.legend = FALSE
+  ) +
+  # Proben: Label unter dem Punkt
+  geom_text(
+    data = subset(plot_ref, Einheit == "Proben"),
+    aes(label = n_label),
+    vjust = 1.2, size = 2.6, show.legend = FALSE
+  ) +
+  facet_wrap(~ Ref, ncol = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = y_lim) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  labs(
+    title = "Positivitätsrate (TMW ≥ 100) pro Monat – Proben vs. Installationen (nach Referat)",
+    x = "Monat",
+    y = "Positivitätsrate",
+    color = ""
+  ) +
+  theme_minimal()
+
+
+```
+
+
+## Hinweise zur Weiterentwicklung und zu Datenstrukturen im gesamten Amt
+
+Für die vorliegende Auswertung wird die bereinigte Adresse (addr_final) als Surrogat für eine Trinkwasserinstallation verwendet. Dieser Ansatz ist pragmatisch und erhöht die Konsistenz der Aggregation deutlich gegenüber der Nutzung von Rohadressen. Er ermöglicht belastbare Auswertungen auch ohne eine im LIMS verfügbare, eindeutige Installationskennung.
+
+Die Datenqualität ließe sich weiter verbessern, wenn Adressen gegen eine externe Referenzdatenbank abgeglichen würden (z.B. Geocoding, amtliche Adressregister). Dadurch könnten kanonische Schreibweisen sichergestellt, Deduplikation robuster umgesetzt (z.B. über Koordinaten) und Sonderfälle wie Umbenennungen oder Ortsteile besser behandelt werden. Der hier gewählte Ansatz ist bewusst offline und heuristisch gehalten, um ohne externe Abhängigkeiten auskommende, reproduzierbare Auswertungen zu ermöglichen.
+
+Langfristig wäre die höchste Qualität erreichbar, wenn eine solche Referenzierung bereits bei der Dateneingabe im LIMS erfolgt. Mechanismen wie Autovervollständigung, Validierung von Straßen-/PLZ-/Ort-Kombinationen oder feste Installationsobjekte mit eindeutiger ID würden die Adressqualität systemisch verbessern. Dadurch ließen sich nachgelagerte Bereinigungsschritte weitgehend vermeiden und Auswertungen – insbesondere für Meldewesen – deutlich stabiler und effizienter gestalten.
+
