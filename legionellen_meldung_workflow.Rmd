@@ -4,6 +4,7 @@ author: " "
 date: "`r format(Sys.Date(), '%d.%m.%Y')`"
 output:
   html_document:
+    code_folding: hide
     toc: true
     toc_depth: 2
     number_sections: true
